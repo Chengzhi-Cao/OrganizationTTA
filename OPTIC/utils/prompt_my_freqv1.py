@@ -1,0 +1,115 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from numpy import random
+import os
+
+
+
+
+class ContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.1, contrast_mode='all'):
+        super(ContrastiveLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        
+    def forward(self, feature1, feature2):
+        """
+        Args:
+            feature1: [1, 3, 512, 512]
+            feature2: [1, 3, 512, 512]
+        Returns:
+            contrastive_loss: scalar
+        """
+        # 将特征图展平为特征向量
+        batch_size, channels, height, width = feature1.shape
+        
+        # 方法1: 全局平均池化得到全局特征
+        feat1_global = F.adaptive_avg_pool2d(feature1, (1, 1)).view(batch_size, -1)  # [1, 3]
+        feat2_global = F.adaptive_avg_pool2d(feature2, (1, 1)).view(batch_size, -1)  # [1, 3]
+        
+        # 归一化特征
+        feat1_global = F.normalize(feat1_global, p=2, dim=1)
+        feat2_global = F.normalize(feat2_global, p=2, dim=1)
+        
+        # 计算相似度矩阵
+        similarity_matrix = torch.matmul(feat1_global, feat2_global.T) / self.temperature  # [1, 1]
+        
+        # 对于batch_size=1的情况，直接最大化相似度
+        loss = -similarity_matrix.mean()
+        
+        return loss
+    
+class Promptv5(nn.Module):
+    def __init__(self, prompt_alpha=1/32, image_size=512):
+        super().__init__()
+        self.prompt_alpha = prompt_alpha
+        self.prompt_size = int(image_size * prompt_alpha) if int(image_size * prompt_alpha) > 1 else 1  # self.prompt_size=5
+        self.padding_size = (image_size - self.prompt_size)//2  # self.padding_size = 253
+        self.init_para = torch.ones((1, 3, self.prompt_size, self.prompt_size)) # self.init_para=[1,3,5,5]
+        self.data_prompt = nn.Parameter(self.init_para, requires_grad=True)# self.data_prompt=[1,3,5,5]
+        self.pre_prompt = self.data_prompt.detach().cpu().data  
+        
+        self.conv1 = nn.Conv2d(3, 3, kernel_size=1,stride=1, bias=False)
+        
+        self.save_path1 = '/data/chengzhicao/VLM/VPTTA-main/visualization/OPTIC'
+        self.global_num = 0
+        v = torch.ones((512,512))
+        self.v = nn.Parameter(v)
+
+        v2 = torch.ones((512,512))
+        self.v2 = nn.Parameter(v2)
+        
+
+    def update(self, init_data):    # init_data=[1,3,5,5]
+        with torch.no_grad():
+            self.data_prompt.copy_(init_data)
+
+    def iFFT(self, amp_src_, pha_src, imgH, imgW):
+        # recompose fft
+        real = torch.cos(pha_src) * amp_src_
+        imag = torch.sin(pha_src) * amp_src_
+        fft_src_ = torch.complex(real=real, imag=imag)
+        src_in_trg = torch.fft.ifft2(fft_src_, dim=(-2, -1), s=[imgH, imgW]).real
+        return src_in_trg
+
+    def forward(self, x):   # x=[1,3,512,512]
+        
+        _, _, imgH, imgW = x.size()
+        fft = torch.fft.fft2(x.clone(), dim=(-2, -1))   # fft=[1,3,512,512]
+
+        # extract amplitude and phase of both ffts
+        amp_src, pha_src = torch.abs(fft), torch.angle(fft) # amp_src=[1,3,512,512], pha_src=[1,3,512,512]
+
+
+        # amp_src = self.conv1(amp_src)
+        amp_src = amp_src * self.v
+        amp_src = torch.fft.fftshift(amp_src)   # amp_src=[1,3,512,512]
+        amp_srcv2 = amp_src * self.v2
+        amp_srcv2 = torch.fft.fftshift(amp_srcv2) # amp_srcv2=[1,3,512,512]
+
+
+
+
+
+        # obtain the low frequency amplitude part
+        prompt = F.pad(self.data_prompt, [self.padding_size, imgH - self.padding_size - self.prompt_size,
+                                          self.padding_size, imgW - self.padding_size - self.prompt_size],
+                       mode='constant', value=1.0).contiguous() # self.data_prompt=[1,3,5,5]
+        # prompt = [1,3,512,512]
+        amp_src_ = amp_src * prompt
+        amp_src_ = torch.fft.ifftshift(amp_src_)
+        # amp_src_ = [1,3,512,512]
+        amp_low_ = amp_src[:, :, self.padding_size:self.padding_size+self.prompt_size, self.padding_size:self.padding_size+self.prompt_size]    # self.padding_size = 253, self.prompt_size=5
+        
+        src_in_trg = self.iFFT(amp_src_, pha_src, imgH, imgW)
+        # return amp_src_, amp_low_ # src_in_trg=[1,3,512,512]根据低频区域还原的图片, amp_low_=[1,3,5,5]是原图片的低频区域
+
+
+        self.global_num = self.global_num + 1
+        
+        return src_in_trg, amp_low_, amp_src,amp_srcv2 # src_in_trg=[1,3,512,512]根据低频区域还原的图片, amp_low_=[1,3,5,5]是原图片的低频区域

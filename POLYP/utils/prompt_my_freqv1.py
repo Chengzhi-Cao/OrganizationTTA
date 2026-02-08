@@ -1,0 +1,64 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Prompt(nn.Module):
+    def __init__(self, prompt_alpha=0.01, image_size=352):
+        super().__init__()
+        self.prompt_size = int(image_size * prompt_alpha) if int(image_size * prompt_alpha) > 1 else 1
+        self.padding_size = (image_size - self.prompt_size)//2
+        self.init_para = torch.ones((1, 3, self.prompt_size, self.prompt_size))
+        self.data_prompt = nn.Parameter(self.init_para, requires_grad=True)
+        self.pre_prompt = self.data_prompt.detach().cpu().data
+        
+        v = torch.ones((352,352))
+        self.v = nn.Parameter(v)
+
+
+        v2 = torch.ones((352,352))
+        self.v2 = nn.Parameter(v2)
+            
+        
+    def update(self, init_data):
+        with torch.no_grad():
+            self.data_prompt.copy_(init_data)
+
+    def iFFT(self, amp_src_, pha_src, imgH, imgW):
+        # recompose fft
+        real = torch.cos(pha_src) * amp_src_
+        imag = torch.sin(pha_src) * amp_src_
+        fft_src_ = torch.complex(real=real, imag=imag)
+
+        src_in_trg = torch.fft.ifft2(fft_src_, dim=(-2, -1), s=[imgH, imgW]).real
+        return src_in_trg
+
+    def forward(self, x):
+        _, _, imgH, imgW = x.size()
+
+        fft = torch.fft.fft2(x.clone(), dim=(-2, -1))
+
+        # extract amplitude and phase of both ffts
+        _amp_src, pha_src = torch.abs(fft), torch.angle(fft)
+        
+        amp_src = _amp_src * self.v
+        amp_src = torch.fft.fftshift(amp_src)
+
+        amp_srcv2 = _amp_src * self.v2
+        amp_srcv2 = torch.fft.fftshift(amp_srcv2) # amp_srcv2=[1,3,512,512]
+
+
+        # obtain the low frequency amplitude part
+        prompt = F.pad(self.data_prompt, [self.padding_size, imgH - self.padding_size - self.prompt_size,
+                                          self.padding_size, imgW - self.padding_size - self.prompt_size],
+                       mode='constant', value=1.0).contiguous()
+
+        amp_src_ = amp_src * prompt
+        amp_src_ = torch.fft.ifftshift(amp_src_)
+
+        amp_low_ = amp_src[:, :, self.padding_size:self.padding_size+self.prompt_size, self.padding_size:self.padding_size+self.prompt_size]
+
+        src_in_trg = self.iFFT(amp_src_, pha_src, imgH, imgW)
+        # return src_in_trg, amp_low_
+
+        return src_in_trg, amp_low_, amp_src,amp_srcv2 # src_in_trg=[1,3,512,512]根据低频区域还原的图片, amp_low_=[1,3,5,5]是原图片的低频区域
